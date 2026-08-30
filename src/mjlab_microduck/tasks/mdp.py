@@ -102,13 +102,14 @@ def _get_base_metadata_no_passive(env, run_path):
     }
 
 _exporter_utils.get_base_metadata = _get_base_metadata_no_passive
-# Also patch the already-imported reference in the velocity task exporter.
-try:
-    from mjlab.tasks.velocity.rl import exporter as _vel_exporter  # noqa: E402
-    if hasattr(_vel_exporter, "get_base_metadata"):
-        _vel_exporter.get_base_metadata = _get_base_metadata_no_passive
-except Exception:
-    pass
+# Also patch the already-imported reference in the velocity runner. mjlab 1.6
+# removed mjlab.tasks.velocity.rl.exporter; the ONNX export now lives in
+# VelocityOnPolicyRunner.save (mjlab/tasks/velocity/rl/runner.py), which binds
+# get_base_metadata into its own namespace at import time — patching
+# exporter_utils alone would not reach it.
+from mjlab.tasks.velocity.rl import runner as _vel_runner  # noqa: E402
+
+_vel_runner.get_base_metadata = _get_base_metadata_no_passive
 
 print("[mdp] Patch 4 active: ONNX export filters passive_* joints")
 
@@ -4610,7 +4611,10 @@ class RelativeHeadingVelocityCommand(VelocityCommandCommandOnly):
         # Zero ang_vel slot; _update_command will fill it each step
         self.vel_command_b[env_ids, 2] = 0.0
 
-    def _update_command(self) -> None:
+    def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
+        # mjlab 1.6: env_ids is None on the per-step path, the reset ids on
+        # reset(). Pure function of the current state — recomputed for all
+        # envs either way, so env_ids is deliberately ignored.
         # Do NOT call super()._update_command() — it would run the heading
         # proportional controller and overwrite cmd[2] with a yaw rate.
         # Instead recompute heading error from scratch each step.
@@ -4993,8 +4997,19 @@ class GroundPickPhaseCommand(UniformVelocityCommand):
     def command(self) -> torch.Tensor:
         return self.vel_command_b
 
-    def compute(self, dt: float) -> None:
-        self._gp_phase = (self._gp_phase + dt / self._period) % 1.0
+    def compute(
+        self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
+    ) -> None:
+        # mjlab 1.6: env_ids=None is the per-step path (all envs; dt may be a
+        # per-env tensor on the auto-reset path — elementwise math handles it),
+        # env_ids scopes the phase advance on the reset path.
+        if env_ids is None:
+            self._gp_phase = (self._gp_phase + dt / self._period) % 1.0
+        else:
+            assert not isinstance(dt, torch.Tensor)
+            self._gp_phase[env_ids] = (
+                self._gp_phase[env_ids] + dt / self._period
+            ) % 1.0
         self.vel_command_b[:, 0] = torch.cos(2 * torch.pi * self._gp_phase)
         self.vel_command_b[:, 1] = torch.sin(2 * torch.pi * self._gp_phase)
         self.vel_command_b[:, 2] = 0.0
@@ -5010,7 +5025,7 @@ class GroundPickPhaseCommand(UniformVelocityCommand):
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         pass  # Phase is continuous; no resampling needed
 
-    def _update_command(self) -> None:
+    def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
         pass  # Updated in compute()
 
     def _update_metrics(self) -> None:
@@ -5080,7 +5095,7 @@ class UniformPoseCommand(CommandTerm):
     def _update_metrics(self) -> None:
         pass
 
-    def _update_command(self) -> None:
+    def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
         pass
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
@@ -6294,8 +6309,13 @@ class SitStandCommand(UniformVelocityCommand):
             (self._stand_z - z) / max(self._stand_z - self._sit_z, 1e-6), 0.0, 1.0
         )
 
-    def compute(self, dt: float) -> None:
-        super().compute(dt)
+    def compute(
+        self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
+    ) -> None:
+        # mjlab 1.6: compute takes env_ids (None on the per-step path, the
+        # reset ids on the reset path); dt may be a per-env tensor when
+        # env_ids is None (auto-reset path).
+        super().compute(dt, env_ids)
         # Episode-start re-init of the blend from the ACTUAL trunk height.
         # Done here (not in reset()) because the command manager resets BEFORE
         # the set_ground_state event teleports the robot, so reset() would read
@@ -6306,10 +6326,14 @@ class SitStandCommand(UniformVelocityCommand):
             self._alpha = torch.where(fresh, self._alpha_from_height(), self._alpha)
         # Constant-rate slew of the target blend toward the commanded flag.
         step = dt / max(self._ramp_s, 1e-6)
-        delta = self.vel_command_b[:, 0] - self._alpha
-        self._alpha += torch.clamp(delta, -step, step)
+        if env_ids is None:
+            delta = self.vel_command_b[:, 0] - self._alpha
+            self._alpha += torch.clamp(delta, -step, step)
+        else:
+            delta = self.vel_command_b[env_ids, 0] - self._alpha[env_ids]
+            self._alpha[env_ids] += torch.clamp(delta, -step, step)
 
-    def _update_command(self) -> None:
+    def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
         pass  # No heading controller / standing-env machinery.
 
     def _update_metrics(self) -> None:

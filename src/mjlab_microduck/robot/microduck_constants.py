@@ -96,10 +96,18 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
+# mjlab 1.6: CollisionCfg's structural fields (contype/conaffinity/condim/
+# priority) are now required and always written, and a dict-valued structural
+# field must cover every matched geom (catch-all ".*" entry). The explicit
+# values reproduce the mjlab 1.3 behavior: contype=1/conaffinity=1 were the
+# 1.3 field defaults, and geoms not matched by the old partial priority dict
+# kept the XML default of 0.
 FULL_COLLISION = CollisionCfg(
-    geom_names_expr=[".*_collision"],
+    geom_names_expr=(".*_collision",),
+    contype=1,
+    conaffinity=1,
     condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
-    priority={r"^(left|right)_foot_collision$": 1},
+    priority={r"^(left|right)_foot_collision$": 1, ".*_collision": 0},
     friction={r"^(left|right)_foot_collision$": (1.0,)},
 )
 
@@ -114,7 +122,9 @@ FULL_COLLISION = CollisionCfg(
 # Exclude passive_* joints (jaw linkage in the new model has no XML actuator).
 # Voltage domain randomization (mirrors mjlab_microban):
 #   - vin_range: per-env battery voltage sampled at startup (replaces fixed vin)
-#   - vin_drop_gain_range: load-dependent voltage sag V_drop = gain * sum(|tau|)
+#   - vin_drop_resistance_range: load-dependent voltage sag from battery + wire
+#     resistance, V_drop = R * I with I = sum(|tau|) / kt (bam commit e4bf1aa
+#     reframed the old vin_drop_gain_range ratio as a resistance)
 #   - vin_min: hard floor on the effective voltage after sag
 # kp_fw kept at 200 (microduck's preserved firmware stiffness; microban uses 125).
 _BAM_ACTUATOR_KWARGS = dict(
@@ -124,7 +134,12 @@ _BAM_ACTUATOR_KWARGS = dict(
     kp_fw=200.0,  # microduck's preserved firmware stiffness (microban uses 125)
     # vin_range=(6.9, 7.9),
     vin_range=(6.5, 8.2),
-    vin_drop_gain_range=(0.0, 0.2),
+    # bam (mjlab_frictionloss branch, e4bf1aa) renamed vin_drop_gain_range ->
+    # vin_drop_resistance_range and reframed the sag as V_drop = R * I with
+    # I = sum(|tau|) / kt. Equivalent resistance = old_gain * kt; xl330 m6 has
+    # kt = 0.366, so the old (0.0, 0.2) V/Nm gain becomes (0.0, 0.073) Ohm —
+    # same effective voltage sag as before.
+    vin_drop_resistance_range=(0.0, 0.073),
     vin_min=6.0,
     # max_current=1.75,
     delay_min_lag=3,
@@ -252,10 +267,10 @@ MICRODUCK_WALK_ROLLERS_ROBOT_CFG = EntityCfg(
 if __name__ == "__main__":
     import mujoco.viewer as viewer
     from mjlab.scene import Scene, SceneCfg
-    from mjlab.terrains import TerrainImporterCfg
+    from mjlab.terrains import TerrainEntityCfg
 
     SCENE_CFG = SceneCfg(
-        terrain=TerrainImporterCfg(terrain_type="plane"),
+        terrain=TerrainEntityCfg(terrain_type="plane"),
         entities={"robot": MICRODUCK_WALK_ROBOT_CFG},
     )
 

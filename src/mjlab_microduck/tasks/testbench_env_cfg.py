@@ -31,13 +31,13 @@ from mjlab.managers import (
 )
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.rl import (
+    RslRlModelCfg,
     RslRlOnPolicyRunnerCfg,
-    RslRlPpoActorCriticCfg,
     RslRlPpoAlgorithmCfg,
 )
 from mjlab.scene import SceneCfg
 from mjlab.sim import MujocoCfg, SimulationCfg
-from mjlab.terrains import TerrainImporterCfg
+from mjlab.terrains import TerrainEntityCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 from mjlab.viewer import ViewerConfig
 
@@ -74,7 +74,9 @@ class TargetAngleCommand(CommandTerm):
             torch.rand(len(env_ids), device=self.device) * (hi - lo) + lo
         )
 
-    def _update_command(self) -> None:
+    def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
+        # mjlab 1.6: _update_command must accept env_ids (None per-step, the
+        # reset ids on reset()). Sample-and-hold command — nothing to do.
         pass
 
     def _update_metrics(self) -> None:
@@ -89,6 +91,11 @@ class TargetAngleCommandCfg(CommandTermCfg):
     joint_name: str = "1"
     range: tuple[float, float] = (-TESTBENCH_MAX_ANGLE_RAD, TESTBENCH_MAX_ANGLE_RAD)
     resampling_time_range: tuple[float, float] = (4.0, 4.0)
+
+    def build(self, env: ManagerBasedRlEnv) -> "TargetAngleCommand":
+        # mjlab 1.6: CommandTermCfg is an ABC with abstract build(); terms are
+        # constructed via cfg.build(env), not the class_type field.
+        return TargetAngleCommand(self, env)
 
 
 # ----------------------------------------------------------------------------
@@ -236,7 +243,7 @@ def make_testbench_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
     return ManagerBasedRlEnvCfg(
         scene=SceneCfg(
-            terrain=TerrainImporterCfg(terrain_type="plane"),
+            terrain=TerrainEntityCfg(terrain_type="plane"),
             entities={"robot": XL330_TESTBENCH_ROBOT_CFG},
             num_envs=1,
             extent=2.0,
@@ -267,13 +274,23 @@ def make_testbench_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
 
 
 MicroduckTestbenchRlCfg = RslRlOnPolicyRunnerCfg(
-    policy=RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
-        actor_hidden_dims=(256, 128, 64),
-        critic_hidden_dims=(256, 128, 64),
+    # mjlab 1.6: RslRlPpoActorCriticCfg is gone; the runner cfg takes
+    # separate actor/critic RslRlModelCfg entries, and init_noise_std moved
+    # into the actor's distribution_cfg.
+    actor=RslRlModelCfg(
+        hidden_dims=(256, 128, 64),
         activation="elu",
+        obs_normalization=False,
+        distribution_cfg={
+            "class_name": "GaussianDistribution",
+            "init_std": 1.0,
+            "std_type": "scalar",
+        },
+    ),
+    critic=RslRlModelCfg(
+        hidden_dims=(256, 128, 64),
+        activation="elu",
+        obs_normalization=False,
     ),
     algorithm=RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
