@@ -204,3 +204,67 @@ register_mjlab_task(
     rl_cfg=MicroduckRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+
+# ---------------------------------------------------------------------------
+# 5K-epoch speed stage: forward max 0.2 -> 2.0 by epoch 2500.
+# ---------------------------------------------------------------------------
+_SPEED20_STAGES = [
+    {"step": 0, "max_forward": 0.2},
+    {"step": 150 * NUM_STEPS_PER_ENV, "max_forward": 0.3},
+    {"step": 300 * NUM_STEPS_PER_ENV, "max_forward": 0.45},
+    {"step": 500 * NUM_STEPS_PER_ENV, "max_forward": 0.6},
+    {"step": 700 * NUM_STEPS_PER_ENV, "max_forward": 0.8},
+    {"step": 1000 * NUM_STEPS_PER_ENV, "max_forward": 1.0},
+    {"step": 1400 * NUM_STEPS_PER_ENV, "max_forward": 1.2},
+    {"step": 1800 * NUM_STEPS_PER_ENV, "max_forward": 1.4},
+    {"step": 2100 * NUM_STEPS_PER_ENV, "max_forward": 1.6},
+    {"step": 2300 * NUM_STEPS_PER_ENV, "max_forward": 1.8},
+    {"step": 2500 * NUM_STEPS_PER_ENV, "max_forward": 2.0},
+]
+
+
+def _make_speed20curr_cfg(play: bool = False):
+    cfg = make_microduck_velocity_env_cfg(play=play)
+    _halve_action_rate_stages(cfg)
+    if play:
+        _set_forward_range(cfg, (-0.4, 2.0))
+        return cfg
+    _set_forward_range(cfg, (-0.4, 0.2))
+    cfg.curriculum["forward_speed_range"] = CurriculumTermCfg(
+        func=forward_speed_curriculum,
+        params={
+            "command_name": "twist",
+            "speed_stages": deepcopy(_SPEED20_STAGES),
+            "rel_forward_envs": cfg.commands["twist"].rel_forward_envs,
+        },
+    )
+    return cfg
+
+
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-MicroDuck-Speed20Curr",
+    env_cfg=_make_speed20curr_cfg(),
+    play_env_cfg=_make_speed20curr_cfg(play=True),
+    rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+
+def _make_speed20curr8k_cfg(play: bool = False):
+    """Speed20Curr for 8192 envs: every curriculum step (incl. the forward-speed
+    ramp) scaled x0.5 so milestones fire at the same TOTAL env-step count as
+    the 4096-env schedule."""
+    cfg = _make_speed20curr_cfg(play=play)
+    if not play:
+        _scale_curriculum_steps(cfg, 4096 / 8192)
+    return cfg
+
+
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-MicroDuck-Speed20Curr8k",
+    env_cfg=_make_speed20curr8k_cfg(),
+    play_env_cfg=_make_speed20curr8k_cfg(play=True),
+    rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
