@@ -47,6 +47,7 @@ def forward_speed_curriculum(
     env_ids: torch.Tensor,
     command_name: str,
     speed_stages: list[dict],
+    rel_forward_envs: float = 0.0,
 ) -> torch.Tensor:
     """Raise the twist command's forward (max lin_vel_x) bound in stages.
 
@@ -58,6 +59,11 @@ def forward_speed_curriculum(
 
     ``speed_stages`` is a list of ``{"step": int, "max_forward": float}`` dicts,
     with ``step`` in per-env steps (epoch * num_steps_per_env).
+
+    ``rel_forward_envs`` is the build-time forward-only-env fraction: mjlab's
+    ``UniformVelocityCommand._resample_command`` clamps that bucket to
+    lin_vel_x >= 0.3, so the bucket is held at 0 while the current cap is
+    below 0.3 and restored once the ramp clears the clamp floor.
     """
     del env_ids  # Unused
 
@@ -71,6 +77,10 @@ def forward_speed_curriculum(
             current_max = stage["max_forward"]
 
     cfg.ranges.lin_vel_x = (cfg.ranges.lin_vel_x[0], current_max)
+    # mjlab clamps forward-only-bucket commands to lin_vel_x >= 0.3 at
+    # resample; with rel_forward_envs=0.2 that would overshoot a cap below
+    # 0.3 in 20% of envs. Gate the bucket until the ramp clears the floor.
+    cfg.rel_forward_envs = 0.0 if current_max < 0.3 else rel_forward_envs
     return torch.tensor([current_max])
 
 
@@ -144,6 +154,8 @@ def _make_speed10curr_cfg(play: bool = False):
         params={
             "command_name": "twist",
             "speed_stages": deepcopy(_SPEED_STAGES),
+            # Build-time forward-only fraction; the term gates it off below 0.3.
+            "rel_forward_envs": cfg.commands["twist"].rel_forward_envs,
         },
     )
     return cfg
