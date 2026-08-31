@@ -263,3 +263,84 @@ register_mjlab_task(
     rl_cfg=MicroduckRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
+
+
+# ---------------------------------------------------------------------------
+# Rolling-average velocity tracking reward (kache/@yacineMTB proposal,
+# 2026-08-31): reward tracks the ROLLING MEAN base velocity over ~one gait
+# cycle instead of the instantaneous velocity, so within-cycle oscillation
+# is not penalized and the policy can trade instantaneous error for higher
+# sustained speed.
+# ---------------------------------------------------------------------------
+class RollingVelocityTracking(ManagerTermBase):
+    """Drop-in replacement for mjlab's ``track_linear_velocity``.
+
+    Identical functional form ``exp(-(||cmd_xy - v_xy||^2 + v_z^2)/std^2)``,
+    with ``v_xy`` replaced by the rolling mean of the body-frame planar
+    velocity over the last ``window`` control steps (default 25 = 0.5 s at
+    50 Hz, about one gait cycle). ``v_z`` stays instantaneous (a rolling z
+    would stop penalizing vertical bouncing). Per-env ring buffer; rows are
+    cleared on env reset (RewardManager calls ``reset`` for class terms).
+    During warmup after a reset the mean runs over the steps seen so far.
+    Command resampling is much slower than the window, so the lag between a
+    fresh command and the rolling velocity is a few % of the hold period.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(env)
+        self.cfg = cfg
+        window = int(cfg.params.get("window", 25))
+        self._buf = torch.zeros(env.num_envs, window, 2, device=env.device)
+        self._count = torch.zeros(env.num_envs, device=env.device)
+        self._idx = 0
+
+    def reset(self, env_ids=None) -> None:
+        if env_ids is None or isinstance(env_ids, slice):
+            self._buf.zero_()
+            self._count.zero_()
+        else:
+            self._buf[env_ids] = 0.0
+            self._count[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        std: float,
+        command_name: str,
+        window: int = 25,
+        **kwargs,
+    ) -> torch.Tensor:
+        asset = env.scene["robot"]
+        command = env.command_manager.get_command(command_name)
+        actual = asset.data.root_link_lin_vel_b
+        # Ring update: all envs step in lockstep, so one global write index
+        # works; freshly reset rows are zeroed and their count restarts, and
+        # the next `window` writes land on distinct slots, so sum/count is
+        # the exact mean both during warmup and at steady state.
+        self._buf[:, self._idx] = actual[:, :2]
+        self._idx = (self._idx + 1) % self._buf.shape[1]
+        self._count = torch.clamp(self._count + 1.0, max=float(self._buf.shape[1]))
+        rolling_xy = self._buf.sum(dim=1) / self._count.clamp(min=1.0).unsqueeze(1)
+        xy_error = torch.sum(torch.square(command[:, :2] - rolling_xy), dim=1)
+        z_error = torch.square(actual[:, 2])
+        return torch.exp(-(xy_error + z_error) / std**2)
+
+
+def _make_adr_roll_cfg(play: bool = False):
+    """Winning ADR-tracking recipe + rolling-velocity reward (single delta)."""
+    cfg = _make_adr_cfg("tracking", env_scale=4096 / 16384, play=play)
+    if play:
+        return cfg
+    term = cfg.rewards["track_linear_velocity"]
+    term.func = RollingVelocityTracking
+    term.params = {**term.params, "window": 25}
+    return cfg
+
+
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-MicroDuck-ADRTrackRoll16k",
+    env_cfg=_make_adr_roll_cfg(),
+    play_env_cfg=_make_adr_roll_cfg(play=True),
+    rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
