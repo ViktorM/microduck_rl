@@ -268,3 +268,8 @@ for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
         rl_cfg=_rl_cfg,
         runner_cls=MicroduckOnPolicyRunner,
     )
+
+# Speed-study variants (Speed10 / Speed10Curr / Scaled8k / Scaled16k) — NEW
+# task ids only, built by post-processing make_microduck_velocity_env_cfg
+# output. Must stay the LAST import: it reads names defined above.
+from . import speed_variants  # noqa: E402,F401
