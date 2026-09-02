@@ -23,9 +23,18 @@ ADR schedule itself is 16k-native and never scaled.
   gate eps 0.15 -> 0.20 and cap ceiling 1.0 -> 1.2 (10 advances of +0.1); the
   action-rate penalty ladder is unchanged (+0.05/advance, capped at 0.5, so it
   saturates at advance 8 and the last two advances raise the cap only).
+- ``Mjlab-Velocity-Flat-MicroDuck-Gait16k-Envelope`` -- SIM-ONLY headroom
+  diagnostic (B4, not deployable): Gait16k with the XL330's PWM ceiling raised
+  x1.5 (``max_pwm`` 1.0 -> 1.5), i.e. the same firmware P-gain and the same
+  1.75 A current limit, but the back-EMF (velocity) side of the torque-speed
+  envelope pushed out by 1.5x: corner speed (vin - R*Imax)/kt 4.3-9.0 ->
+  13.2-20.2 rad/s, no-load speed vin/kt 17.8-22.4 -> 26.6-33.6 rad/s. Peak
+  driving torque (kt*Imax = 0.64 Nm) and MuJoCo's forcerange (1.07 Nm, which
+  already clips braking) are unchanged, so the ONE thing that moves is how
+  much torque is left at high joint speed.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -33,6 +42,11 @@ from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.tasks.registry import register_mjlab_task
 
+from mjlab_microduck.actuator import FrictionDRBamActuatorCfg
+from mjlab_microduck.robot.microduck_constants import (
+    _BAM_ACTUATOR_KWARGS,
+    MICRODUCK_WALK_ROBOT_CFG,
+)
 from mjlab_microduck.tasks import MicroduckOnPolicyRunner
 from mjlab_microduck.tasks.adr_variants import _make_adr_cfg
 from mjlab_microduck.tasks.microduck_velocity_env_cfg import MicroduckRlCfg
@@ -119,6 +133,73 @@ register_mjlab_task(
     task_id="Mjlab-Velocity-Flat-MicroDuck-ADRTrack12-16k",
     env_cfg=_make_adr_cfg("tracking", env_scale=_ADR_TRACK_SCALE, params=_ADR12_PARAMS),
     play_env_cfg=_make_adr_cfg("tracking", play=True, params=_ADR12_PARAMS),
+    rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+
+# ---------------------------------------------------------------------------
+# B4: actuator-envelope headroom diagnostic -- Gait16k with the XL330 voltage
+# rail raised x1.5. SIM-ONLY, NOT DEPLOYABLE.
+# ---------------------------------------------------------------------------
+@dataclass(kw_only=True)
+class EnvelopeBamActuatorCfg(FrictionDRBamActuatorCfg):
+    """FrictionDRBamActuatorCfg whose BAM control law may drive the PWM duty
+    cycle past 1.0 (``max_pwm`` scaled by ``max_pwm_scale``).
+
+    SIM-ONLY DIAGNOSTIC -- NOT DEPLOYABLE. A real XL330 cannot exceed duty
+    1.0; this measures how much running speed the policy recovers when the
+    back-EMF side of the actuator envelope is pushed out, nothing else.
+
+    In BAM's voltage model ``V = vin * clip(kp * error_gain * dq_err,
+    +-max_pwm)`` and ``tau = kt * V / R - kt^2 * dq / R``, so scaling
+    ``max_pwm`` by s is exactly "supply rail x s with the firmware gain / s":
+    the linear-region PD gains are unchanged (kp_eff = kt*vin*kp*error_gain/R,
+    kd_eff = kt^2/R), the firmware current limiter (1.75 A -> 0.64 Nm peak
+    driving torque) is unchanged, the battery-sag model is unchanged, and
+    MuJoCo's ``forcerange`` (set from vin_range, 1.07 Nm) still clips braking
+    torque exactly as before. What moves is only the speed at which the
+    voltage rail starts eating the available torque (corner speed
+    ``(s*vin - R*Imax)/kt``) and the no-load speed ``s*vin/kt``.
+
+    The XL330 actuator's ``max_pwm`` is a plain attribute of the per-actuator
+    BAM model (bam.dynamixel.actuator.XL330Actuator, default 1.0; bam's
+    ``BamActuatorCfg`` exposes no field for it), and ``BamActuator.__init__``
+    loads a fresh model instance per actuator, so the override here touches
+    nothing shared.
+    """
+
+    max_pwm_scale: float = 1.5
+
+    def build(self, entity, target_ids, target_names):
+        act = super().build(entity, target_ids, target_names)
+        act._bam_model.actuator.max_pwm *= self.max_pwm_scale
+        return act
+
+
+_ENVELOPE_ROBOT_CFG = replace(
+    MICRODUCK_WALK_ROBOT_CFG,
+    articulation=replace(
+        MICRODUCK_WALK_ROBOT_CFG.articulation,
+        actuators=(EnvelopeBamActuatorCfg(**_BAM_ACTUATOR_KWARGS, max_pwm_scale=1.5),),
+    ),
+)
+
+
+def _make_envelope_cfg(play: bool = False):
+    """Gait16k recipe (B2) with the relaxed-envelope actuator swapped in on a
+    COPY of the walk robot cfg (the shared MICRODUCK_WALK_ROBOT_CFG is not
+    mutated). The play cfg carries the same actuator so probes measure the
+    policy inside the envelope it was trained in."""
+    cfg = _make_gait_cfg(play=play)
+    cfg.scene.entities = {"robot": _ENVELOPE_ROBOT_CFG}
+    return cfg
+
+
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-MicroDuck-Gait16k-Envelope",
+    env_cfg=_make_envelope_cfg(),
+    play_env_cfg=_make_envelope_cfg(play=True),
     rl_cfg=MicroduckRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
