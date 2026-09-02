@@ -274,3 +274,4 @@ for _task_id, _make_cfg, _kw, _rl_cfg, _robot_cfg in _BACKLASH_TASKS:
 # output. Must stay the LAST import: it reads names defined above.
 from . import speed_variants  # noqa: E402,F401
 from . import adr_variants  # noqa: E402,F401
+from . import blane_variants  # noqa: E402,F401

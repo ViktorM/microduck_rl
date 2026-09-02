@@ -167,3 +167,19 @@ def microduck_vel_symmetry(
         aug_actions = torch.cat([actions, actions_sym], dim=0)
 
     return aug_obs, aug_actions
+
+
+def mirror_maps() -> dict:
+    """Index/sign maps of the bilateral mirror, for trainers that implement
+    the mirror loss themselves (rl_games ``config.symmetry_loss.maps``).
+
+    ``obs[:, obs_perm] * obs_sign`` mirrors a raw 61-D actor obs and
+    ``act[:, act_perm] * act_sign`` a 14-D action -- the same tables
+    :func:`microduck_vel_symmetry` applies.
+    """
+    return {
+        "obs_perm": list(_OBS_PERM),
+        "obs_sign": list(_OBS_SIGN),
+        "act_perm": list(_JOINT_PERM),
+        "act_sign": list(_JOINT_SIGN),
+    }
