@@ -225,11 +225,20 @@ _ADR_PARAMS = dict(
 )
 
 
-def _make_adr_cfg(gate: str, env_scale: float | None = None, play: bool = False):
+def _make_adr_cfg(
+    gate: str,
+    env_scale: float | None = None,
+    play: bool = False,
+    params: dict | None = None,
+):
+    """``params`` overrides entries of ``_ADR_PARAMS`` (e.g. a looser
+    ``track_threshold`` / higher ``vel_max``); the play cfg's forward range
+    follows ``vel_max``."""
+    adr_params = {**_ADR_PARAMS, **(params or {})}
     cfg = make_microduck_velocity_env_cfg(play=play)
     if play:
         # Play env: final range, uniform sampling, no ADR machinery.
-        _set_forward_range(cfg, (-0.4, 1.0))
+        _set_forward_range(cfg, (-0.4, adr_params["vel_max"]))
         return cfg
     if env_scale is not None:
         _scale_curriculum_steps(cfg, env_scale)
@@ -242,7 +251,7 @@ def _make_adr_cfg(gate: str, env_scale: float | None = None, play: bool = False)
         params=dict(
             gate=gate,
             rel_forward_envs=cfg.commands["twist"].rel_forward_envs,
-            **_ADR_PARAMS,
+            **adr_params,
         ),
     )
     return cfg

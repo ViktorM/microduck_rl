@@ -19,6 +19,10 @@ ADR schedule itself is 16k-native and never scaled.
   ([0.125, 0.300] s); the baseline gait sits inside that window (mean
   current-air-time 0.115 s => swing ~0.23 s), so the window is not binding.
   The touchdown form adds a LINEAR incentive for longer swings/steps.
+- ``Mjlab-Velocity-Flat-MicroDuck-ADRTrack12-16k`` -- higher targets: tracking
+  gate eps 0.15 -> 0.20 and cap ceiling 1.0 -> 1.2 (10 advances of +0.1); the
+  action-rate penalty ladder is unchanged (+0.05/advance, capped at 0.5, so it
+  saturates at advance 8 and the last two advances raise the cap only).
 """
 
 from dataclasses import replace
@@ -101,6 +105,20 @@ register_mjlab_task(
     task_id="Mjlab-Velocity-Flat-MicroDuck-Gait16k",
     env_cfg=_make_gait_cfg(),
     play_env_cfg=_make_gait_cfg(play=True),
+    rl_cfg=MicroduckRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+
+# ---------------------------------------------------------------------------
+# B3: higher targets -- looser tracking gate, cap ceiling 1.2 m/s.
+# ---------------------------------------------------------------------------
+_ADR12_PARAMS = dict(track_threshold=0.20, vel_max=1.2)
+
+register_mjlab_task(
+    task_id="Mjlab-Velocity-Flat-MicroDuck-ADRTrack12-16k",
+    env_cfg=_make_adr_cfg("tracking", env_scale=_ADR_TRACK_SCALE, params=_ADR12_PARAMS),
+    play_env_cfg=_make_adr_cfg("tracking", play=True, params=_ADR12_PARAMS),
     rl_cfg=MicroduckRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
