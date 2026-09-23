@@ -55,6 +55,96 @@ uv run train Mjlab-Velocity-Flat-MicroDuck --env.scene.num-envs 4096 \
 No GPU? Add `--hf-jobs` to any train command to run it on Hugging Face Jobs
 instead of locally (see [scripts/hf/README.md](scripts/hf/README.md)).
 
+## Training with rl_games
+
+This fork runs the MicroDuck tasks on **mjlab 1.6 / MuJoCo 3.11 / mujoco-warp 3.11 /
+warp 1.16 / torch 2.13** (upstream pins mjlab 1.3) and trains them with
+[rl_games](https://github.com/Denys88/rl_games) next to the stock rsl-rl path. Same
+environments, rewards, curricula and actuator model; the ONNX a policy exports to is the
+one the robot runtime loads. Branch `rl-games` (default) carries the port, the rl_games
+support and the extra tasks; `speed-lane` carries the faster-gait experiments; `develop`
+and `main` mirror upstream untouched.
+
+### Install (the stack our runs used)
+
+```bash
+python3.12 -m venv .venv && . .venv/bin/activate
+pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+pip install "mjlab==1.6.0"                     # mujoco 3.11, mujoco-warp 3.11, warp-lang 1.16, rsl-rl-lib 5.4.2
+pip install "git+https://github.com/Rhoban/bam.git@57d13ead53206a6bf0db3d66f86506ae8c2ce01a"   # better-actuator-models, mjlab_frictionloss branch
+pip install -e .                               # this repo: registers the Mjlab-*-MicroDuck tasks
+pip install "git+https://github.com/Denys88/rl_games.git@master"   # rl_games 2.0: MJLAB vecenv, play viewer, ONNX-ready models
+```
+
+`uv sync` with the re-locked `uv.lock` targets the same stack; the pip lines above are
+what produced every number below.
+
+### Train
+
+The rl_games configs live in rl_games' repo under `rl_games/configs/mjlab/`:
+
+```bash
+# Pollen's geometry (4096 envs x 24 steps), their reward function verbatim
+python runner.py --train --file rl_games/configs/mjlab/ppo_microduck_velocity.yaml
+# any registered task: point env_config.task_name at it, e.g. Mjlab-BallWalk-Flat-MicroDuck
+```
+
+The shipped recipe is Pollen's with four rl_games-side choices measured on paired seeds:
+`entropy_coef 0`, an explicit adaptive-rate band (`max_lr 1e-3`), `clip_actions: false`
+(mjlab scales and clamps in the env) and `normalize_value: true`. On the flat velocity
+task it reaches Pollen's final training return in about 3 minutes and finishes 15 % above
+it at the same budget; results, plots and the recipe notes are in
+[rl_games/docs/MJLAB.md](https://github.com/Denys88/rl_games/blob/master/docs/MJLAB.md).
+
+### Watch a policy (play)
+
+```bash
+python -m rl_games.envs.mjlab_play --file ppo_microduck_velocity.yaml \
+    --checkpoint runs/<run>/nn/MJLab_MicroDuck_Velocity.pth        # native window, keypad drives the command
+python -m rl_games.envs.mjlab_play --file ... --checkpoint ... --viewer viser   # browser UI when headless
+```
+
+`runs/<run>/nn/<name>.pth` is the best-reward checkpoint; `last_<name>_ep_<N>_rew_<R>.pth`
+are periodic ones.
+
+### Export to ONNX (the deployable file)
+
+```bash
+python scripts/export_rl_games.py Mjlab-Velocity-Flat-MicroDuck \
+    --config ppo_microduck_velocity.yaml --checkpoint runs/<run>/nn/MJLab_MicroDuck_Velocity.pth \
+    --onnx-file my_walking.onnx --validate-steps 500
+```
+
+The file is `actor(normalizer(obs))`: input `obs` `[1, 61]`, output `actions` `[1, 14]`,
+opset 18, with the same metadata `scripts/export.py` attaches to rsl-rl exports (joint
+names and order, gains, default pose, command and observation names, action scale) plus the
+trainer, config and checkpoint it came from. `--validate-steps` rolls the exported file back
+into the task and reports falls and forward speed; `scripts/infer_policy.py --walking
+my_walking.onnx` drives it in CPU MuJoCo with the keyboard, the same sim2sim check Pollen
+runs on their own exports.
+
+### Run it on the robot
+
+The runtime (`robotd`, [pollen-robotics/microduck](https://github.com/pollen-robotics/microduck))
+loads any `[1, 61] -> [1, 14]` ONNX; it checks the shape at load and refuses anything else.
+Policies live in `/opt/robot/policies/current/` in named slots (`walk`, `stand`, `sitstand`,
+`roulade`, ...; the current default `walk` slot is `velstand.onnx`, a policy that walks on
+a twist command and stands still at zero).
+
+```bash
+scp my_walking.onnx radxa@<duck>:/home/radxa/
+ssh radxa@<duck> sudo robotctl policy load walk /home/radxa/my_walking.onnx   # swaps the network live
+ssh radxa@<duck> robotctl policy list                                         # what is loaded
+ssh radxa@<duck> sudo robotctl policy reset walk                              # back to the default
+```
+
+The training env applies no action low-pass; the runtime's `head_lowpass` / `legs_lowpass` default to 0.5 / 0.7 for Pollen's alpha policies. For a policy trained here set both to `1.0` in `/etc/robot/robotd.toml` (or train with the matching filter): a filter the policy was not trained with changes the closed loop.
+The gamepad's left stick drives `vx, vy`, the right stick the yaw rate, the same twist
+command block the policy was trained on (obs slots 48 to 61). We have not run our policies
+on hardware yet; the sim2sim path above is where the contract is checked until the robots
+arrive.
+
+
 ## Tasks
 
 `uv run list-envs` prints the live registry. Flat/Rough variants exist where noted.
