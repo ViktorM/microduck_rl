@@ -14,26 +14,36 @@ from mjlab.utils.spec_config import CollisionCfg
 _ROBOT_DIR: Path = Path(os.path.dirname(__file__)) / "microduck"
 
 MICRODUCK_WALK_XML: Path = _ROBOT_DIR / "robot_walk.xml"
-# Full-collision model, shared by standup / ground-pick / walk-rollers tasks.
+# Ground-contact model (formerly "allcollisions"): curated collision set for
+# the parts that touch the floor in body-on-ground tasks (soles, legs, trunk
+# shells, head shells, jaw, battery, hips) — NOT every geom. Shared by
+# standup / ground-pick / sitstand / roulade / walk-rollers tasks.
+MICRODUCK_GROUNDCONTACT_XML: Path = _ROBOT_DIR / "robot_groundcontact.xml"
+# TRUE all-collisions model: every part carries a collision geom (70 geoms,
+# 37 meshes; power_support demoted to self_collision_only like every variant).
+# No task uses it yet — exported 2026-09 for future envs needing full contact.
 MICRODUCK_ALLCOLLISIONS_XML: Path = _ROBOT_DIR / "robot_allcollisions.xml"
 # 70mm / 15g ball prop for the BallKick task.
 MICRODUCK_BALL_XML: Path = _ROBOT_DIR / "ball.xml"
 # Roller-skate model: 14 actuated joints + passive wheel hinges (passive_*wheel).
-MICRODUCK_ALLCOLLISIONS_ROLLERS_XML: Path = _ROBOT_DIR / "robot_allcollisions_rollers.xml"
+MICRODUCK_GROUNDCONTACT_ROLLERS_XML: Path = _ROBOT_DIR / "robot_groundcontact_rollers.xml"
 # Backlash models: every servo joint gets an unactuated passive_<joint>_backlash
 # hinge in series (±1° play, 2° total). Exported via
-# config_mjcf_{allcollisions,walk}_backlash.json (add_backlash.py post-processor).
-MICRODUCK_ALLCOLLISIONS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_allcollisions_backlash.xml"
+# config_mjcf_{groundcontact,walk}_backlash.json (add_backlash.py post-processor).
+MICRODUCK_GROUNDCONTACT_BACKLASH_XML: Path = _ROBOT_DIR / "robot_groundcontact_backlash.xml"
 MICRODUCK_WALK_BACKLASH_XML: Path = _ROBOT_DIR / "robot_walk_backlash.xml"
-MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_allcollisions_rollers_backlash.xml"
+MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_groundcontact_rollers_backlash.xml"
+MICRODUCK_ALLCOLLISIONS_BACKLASH_XML: Path = _ROBOT_DIR / "robot_allcollisions_backlash.xml"
 
 assert MICRODUCK_WALK_XML.exists(), f"XML not found: {MICRODUCK_WALK_XML}"
+assert MICRODUCK_GROUNDCONTACT_XML.exists(), f"XML not found: {MICRODUCK_GROUNDCONTACT_XML}"
 assert MICRODUCK_ALLCOLLISIONS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_XML}"
 assert MICRODUCK_BALL_XML.exists(), f"XML not found: {MICRODUCK_BALL_XML}"
-assert MICRODUCK_ALLCOLLISIONS_ROLLERS_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_ROLLERS_XML}"
-assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
+assert MICRODUCK_GROUNDCONTACT_ROLLERS_XML.exists(), f"XML not found: {MICRODUCK_GROUNDCONTACT_ROLLERS_XML}"
+assert MICRODUCK_GROUNDCONTACT_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_GROUNDCONTACT_BACKLASH_XML}"
 assert MICRODUCK_WALK_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_WALK_BACKLASH_XML}"
-assert MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML}"
+assert MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML}"
+assert MICRODUCK_ALLCOLLISIONS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_ALLCOLLISIONS_BACKLASH_XML}"
 
 
 def get_walk_spec() -> mujoco.MjSpec:
@@ -41,17 +51,50 @@ def get_walk_spec() -> mujoco.MjSpec:
 
 
 def get_standup_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML))
+    return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_XML))
 
 
 def get_ground_pick_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML))
+    return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_XML))
 
 
 def get_walk_rollers_spec() -> mujoco.MjSpec:
-    # NOTE: was loading robot_allcollisions.xml (no wheels) — the roller env
+    # NOTE: was loading robot_groundcontact.xml (no wheels) — the roller env
     # silently ran on the wheel-less standup model.
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_ROLLERS_XML))
+    return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_ROLLERS_XML))
+
+
+SERVO_MESH_NAME = "xl330"
+SERVO_GEOM_SUFFIX = "_servo_collision"
+
+
+def name_servo_collision_geoms(spec: mujoco.MjSpec) -> mujoco.MjSpec:
+    """Name every collision geom that is an XL330 housing mesh.
+
+    The onshape-to-robot export leaves collision geoms unnamed (only the two
+    foot soles are named by the export config). The protective-fall tasks need a
+    contact sensor on the servo housings specifically — a servo hitting the floor
+    is the event that strips gears — so this names each housing collision geom
+    ``<body>_<k>_servo_collision``. The ``_collision`` suffix puts them under
+    FULL_COLLISION (condim 1) like the other named collision geoms.
+    """
+    counts: dict[str, int] = {}
+    for geom in spec.geoms:
+        if geom.meshname != SERVO_MESH_NAME or (geom.contype == 0 and geom.conaffinity == 0):
+            continue
+        body = geom.parent.name
+        k = counts.get(body, 0)
+        counts[body] = k + 1
+        geom.name = f"{body}_{k}{SERVO_GEOM_SUFFIX}"
+    return spec
+
+
+def get_allcollisions_spec() -> mujoco.MjSpec:
+    return name_servo_collision_geoms(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_XML)))
+
+
+def get_allcollisions_backlash_spec() -> mujoco.MjSpec:
+    return name_servo_collision_geoms(mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_BACKLASH_XML)))
 
 
 def get_ball_spec() -> mujoco.MjSpec:
@@ -59,7 +102,7 @@ def get_ball_spec() -> mujoco.MjSpec:
 
 
 def get_backlash_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_BACKLASH_XML))
+    return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_BACKLASH_XML))
 
 
 def get_walk_backlash_spec() -> mujoco.MjSpec:
@@ -67,7 +110,7 @@ def get_walk_backlash_spec() -> mujoco.MjSpec:
 
 
 def get_rollers_backlash_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_ALLCOLLISIONS_ROLLERS_BACKLASH_XML))
+    return mujoco.MjSpec.from_file(str(MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML))
 
 
 HOME_FRAME = EntityCfg.InitialStateCfg(
@@ -191,6 +234,19 @@ MICRODUCK_STANDUP_ROBOT_CFG = EntityCfg(
     ),
 )
 
+# True full-collision model (every part collides, servo housings named — see
+# name_servo_collision_geoms). For tasks where the robot falls onto arbitrary
+# parts and the reward must know WHICH part hit: VelStand / protective fall.
+MICRODUCK_ALLCOLLISIONS_ROBOT_CFG = EntityCfg(
+    spec_fn=get_allcollisions_spec,
+    init_state=HOME_FRAME,
+    collisions=(FULL_COLLISION,),
+    articulation=EntityArticulationInfoCfg(
+        actuators=(actuators,),
+        soft_joint_pos_limit_factor=0.9,
+    ),
+)
+
 MICRODUCK_GROUND_PICK_ROBOT_CFG = EntityCfg(
     spec_fn=get_ground_pick_spec,
     init_state=HOME_FRAME,
@@ -204,7 +260,7 @@ MICRODUCK_GROUND_PICK_ROBOT_CFG = EntityCfg(
 # Backlash robots: base model + ±1° serial backlash hinge per servo.
 # Encoder reads through the backlash (BacklashEncoderBamActuator feedback +
 # joint_pos/vel_rel_backlash observations — see tasks/backlash.py).
-# Allcollisions variant → VelStand/StandUp backlash tasks (mirrors
+# Groundcontact variant → VelStand/StandUp backlash tasks (mirrors
 # MICRODUCK_STANDUP_ROBOT_CFG); walk variant → Velocity backlash
 # tasks (mirrors MICRODUCK_WALK_ROBOT_CFG, keeps backlash-vs-base comparisons
 # unconfounded by the collision model).
@@ -220,6 +276,18 @@ MICRODUCK_BACKLASH_ROBOT_CFG = EntityCfg(
 
 MICRODUCK_WALK_BACKLASH_ROBOT_CFG = EntityCfg(
     spec_fn=get_walk_backlash_spec,
+    init_state=BACKLASH_HOME_FRAME,
+    collisions=(FULL_COLLISION,),
+    articulation=EntityArticulationInfoCfg(
+        actuators=(backlash_actuators,),
+        soft_joint_pos_limit_factor=0.9,
+    ),
+)
+
+# All-collisions backlash robot → VelStand backlash tasks (mirrors
+# MICRODUCK_ALLCOLLISIONS_ROBOT_CFG).
+MICRODUCK_ALLCOLLISIONS_BACKLASH_ROBOT_CFG = EntityCfg(
+    spec_fn=get_allcollisions_backlash_spec,
     init_state=BACKLASH_HOME_FRAME,
     collisions=(FULL_COLLISION,),
     articulation=EntityArticulationInfoCfg(

@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import math
 import os
 import pickle
@@ -24,6 +25,85 @@ MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_robot_walk.xml"
 MICRODUCK_ROLLERS_XML = "src/mjlab_microduck/robot/microduck/scene_rollers.xml"
 MICRODUCK_BALL_XML = "src/mjlab_microduck/robot/microduck/scene_ball.xml"
+
+# BAM M6 defaults — MUST mirror `_BAM_ACTUATOR_KWARGS` in
+# src/mjlab_microduck/robot/microduck_constants.py (the actuator every policy is
+# trained against in warp). Not imported from there: that module drags in
+# mjlab/torch/warp (~16 s import) for a CPU rehearsal script. Locked by
+# tests/test_infer_policy_bam.py.
+BAM_MOTOR_NAME = "xl330"
+BAM_MODEL = "m6"
+BAM_KP_FW = 200.0                 # microduck's preserved firmware stiffness
+BAM_VIN_RANGE = (6.5, 8.2)        # per-env battery voltage DR in training
+BAM_VIN_DROP_GAIN_RANGE = (0.0, 0.2)  # load-dependent sag V_drop = gain * sum|tau|
+BAM_VIN_MIN = 6.0                 # floor on effective voltage after sag
+BAM_MAX_CURRENT = None            # training runs WITHOUT the firmware current limiter
+# Stiff joint-friction constraint, copied from bam.mjlab.BamActuator
+# (stiff_frictionloss=True in training): warp has no noslip solver, so BAM
+# stiffens frictionloss so a statically-held joint does not creep. Mirrored
+# here so CPU and warp apply the same friction budget the same way.
+BAM_STIFF_SOLREF_FRICTION = (-5.0e4, -2.0e2)
+BAM_STIFF_SOLIMP_FRICTION = (0.99, 0.9999, 0.001, 0.5, 2.0)
+
+
+def load_bam_model(kp_fw: float, vin: float, max_current):
+    """Build the BAM M6 model + XL330 voltage-controlled actuator."""
+    from bam.model import load_model
+    bam_model = load_model(motor_name=BAM_MOTOR_NAME, model=BAM_MODEL)
+    bam_model.actuator.kp = kp_fw
+    bam_model.actuator.vin = vin
+    bam_model.actuator.max_current = max_current if (max_current and max_current > 0) else None
+    return bam_model
+
+
+def load_mujoco_with_bam(xml_path: str, bam_model, timestep: float, vin_drop_gain, vin_min):
+    """Load the scene and hand every non-passive actuator to bam.mujoco.MujocoController.
+
+    Mirrors bam.mjlab.BamActuator.edit_spec (what warp does at training time):
+    position actuators -> torque motors with the voltage-bounded forcerange,
+    joint damping/frictionloss zeroed (BAM rewrites them every step), stiff
+    friction constraint. Armature is set on the dofs by MujocoController.
+    Returns (model, data, bam_ctrl, actuator_names).
+    """
+    from bam.mujoco import MujocoController
+
+    kt = bam_model.kt.value
+    R = bam_model.R.value
+    force_limit = bam_model.actuator.vin * kt / R
+
+    spec = mujoco.MjSpec.from_file(xml_path)
+    names = []
+    for act in spec.actuators:
+        tgt = act.target
+        tgt_name = tgt.name if hasattr(tgt, "name") else str(tgt)
+        if tgt_name.startswith("passive_"):
+            continue
+        act.set_to_motor()
+        act.forcelimited = True
+        act.forcerange = (-force_limit, force_limit)
+        act.ctrllimited = False
+        act.gear = [1.0, 0, 0, 0, 0, 0]
+        names.append(act.name)
+        for joint in spec.joints:
+            if joint.name == tgt_name:
+                joint.damping = np.zeros((3, 1))  # MjsJoint expects a (3,1) array
+                joint.frictionloss = 0.0
+                joint.solref_friction = BAM_STIFF_SOLREF_FRICTION
+                joint.solimp_friction = BAM_STIFF_SOLIMP_FRICTION
+                break
+
+    model = spec.compile()
+    model.opt.timestep = timestep
+    data = mujoco.MjData(model)
+    bam_ctrl = MujocoController(bam_model, names, model, data,
+                                vin_drop_gain=vin_drop_gain, vin_min=vin_min)
+    print(f"BAM {BAM_MODEL} actuators on {len(names)} joints: kt={kt:.4f} R={R:.4f} "
+          f"vin={bam_model.actuator.vin:.2f}V kp_fw={bam_model.actuator.kp:.0f} "
+          f"vin_drop_gain={vin_drop_gain} vin_min={vin_min} "
+          f"max_current={bam_model.actuator.max_current} forcerange=+/-{force_limit:.3f}Nm "
+          f"armature={bam_model.actuator.get_extra_inertia():.2e}")
+    return model, data, bam_ctrl, names
+
 
 # Body pose command constants (must match training constants)
 BODY_CMD_MAX_Z = 0.03              # ±30 mm
@@ -130,7 +210,7 @@ class TerminalInput:
 
 
 class PolicyInference:
-    def __init__(self, model, data, walking_onnx_path=None, action_scale=1.0,
+    def __init__(self, model, data, walking_onnx_path=None, action_scale=1.0, bam_ctrl=None,
                  delay_min_lag=0, delay_max_lag=0,
                  standing_onnx_path=None, switch_threshold=0.05,
                  use_projected_gravity=False, ground_pick_onnx_path=None, ground_pick_period=4.0,
@@ -139,6 +219,7 @@ class PolicyInference:
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
                  kick_duration=3.0, roulade_duration=2.0):
+        self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
         self.action_scale = action_scale
@@ -793,17 +874,303 @@ class PolicyInference:
         else:
             target_positions = self.default_pose + action * self.action_scale
 
-        self.data.ctrl[:] = target_positions
         # Legacy mode: head_offset is an external perturbation added on top of
         # the policy output. New mode: head_offset is a COMMAND fed into the
         # policy's obs, so the policy itself produces the offset head pose.
         if not self.new_cmd_obs:
-            self.data.ctrl[5:9] += self.head_offset
+            target_positions = target_positions.copy()
+            target_positions[5:9] += self.head_offset
+        self.set_position_targets(target_positions)
+
+    def set_position_targets(self, target_positions):
+        """Send joint position targets to the actuators.
+
+        BAM: the firmware position loop lives in the controller (ctrl is the
+        motor TORQUE it writes on update()). Legacy: MuJoCo position actuators.
+        """
+        if self.bam_ctrl is not None:
+            self.bam_ctrl.q_target[:] = target_positions
+        else:
+            self.data.ctrl[:] = target_positions
+
+
+# ---------------------------------------------------------------------------
+# Odometry anchor points (--odom-anchor-points, --odom-compare)
+#
+# The robot's contact odometry (microduck/odometry/src/lib.rs) tracks the trunk
+# from the lowest of a set of candidate contact points on the soles, expressed
+# in each foot's site frame. scripts/odom_anchor_points.py samples those sets
+# on the sole mesh and writes them to scripts/odom_anchor_sets.json:
+#   v15      the legacy ±27.0 x ±20.6 mm bbox on the site plane (production)
+#   alpha4   the flat patch's four corners, on the mesh
+#   alpha16  a 4x4 grid over the whole footprint, on the mesh
+# --odom-anchor-points draws them; --odom-compare runs a Python replica of the
+# estimator per set on the simulated legs + a perfect IMU and scores each
+# against MuJoCo's ground-truth trunk pose.
+# ---------------------------------------------------------------------------
+
+ODOM_ANCHOR_SETS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "odom_anchor_sets.json")
+ODOM_SET_RGBA = {
+    "v15": (0.1, 0.5, 1.0, 1.0),       # blue
+    "alpha4": (0.1, 0.9, 0.3, 1.0),    # green
+    "alpha16": (1.0, 0.3, 1.0, 1.0),   # magenta
+}
+_ODOM_FALLBACK_RGBA = (1.0, 0.8, 0.1, 1.0)
+
+
+def load_odom_anchor_sets(names="all"):
+    """{name: [left (N,3), right (N,3)]} from the generated JSON, in the order
+    the file lists them; `names` is 'all' or a comma-separated subset."""
+    with open(ODOM_ANCHOR_SETS_JSON) as f:
+        sets = json.load(f)["sets"]
+    if names != "all":
+        wanted = names.split(",")
+        missing = [n for n in wanted if n not in sets]
+        if missing:
+            raise SystemExit(f"unknown odometry anchor set(s) {missing}; have {list(sets)}")
+        sets = {n: sets[n] for n in wanted}
+    return {n: [np.asarray(v["left"], dtype=np.float64), np.asarray(v["right"], dtype=np.float64)]
+            for n, v in sets.items()}
+
+
+def _quat2mat(q):
+    m = np.zeros(9)
+    mujoco.mju_quat2Mat(m, np.asarray(q, dtype=np.float64))
+    return m.reshape(3, 3)
+
+
+class FootFrames:
+    """Foot-site poses relative to the trunk, and the trunk's world pose — what
+    the robot's odometry gets from FK and the IMU, here from the simulator."""
+
+    def __init__(self, model):
+        self.trunk = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
+        self.sites = []
+        for side in ("left", "right"):
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, f"{side}_foot")
+            if sid < 0:
+                raise RuntimeError(f"scene has no '{side}_foot' site; the odometry needs it")
+            self.sites.append(sid)
+
+    def trunk_world(self, data):
+        return data.xpos[self.trunk].copy(), data.xmat[self.trunk].reshape(3, 3).copy()
+
+    def feet_in_trunk(self, data):
+        p_t, R_t = self.trunk_world(data)
+        out = []
+        for sid in self.sites:
+            out.append((R_t.T @ (data.site_xpos[sid] - p_t), R_t.T @ data.site_xmat[sid].reshape(3, 3)))
+        return out
+
+    def feet_world(self, data):
+        return [(data.site_xpos[sid].copy(), data.site_xmat[sid].reshape(3, 3).copy()) for sid in self.sites]
+
+
+class PyOdometry:
+    """Line-for-line replica of microduck/odometry/src/lib.rs `Odometry::update`
+    for one anchor set: anchor the lowest sole point to the ground, orient the
+    trunk by the IMU, move the anchor when another point drops below it and
+    holds the claim for SWITCH_CONFIRM_TICKS."""
+
+    SWITCH_MARGIN = -0.010
+    SWITCH_CONFIRM_TICKS = 2
+
+    def __init__(self, name, corners):
+        self.name = name
+        self.corners = corners            # [left (N,3), right (N,3)] in the site frames
+        self.anchor_foot = 0
+        self.anchor_local = np.zeros(3)
+        self.anchor_xy = np.zeros(2)
+        self.position = np.zeros(3)
+        self.pending = None               # (foot, local, world_xy)
+        self.pending_ticks = 0
+        self.needs_init = True
+
+    def update(self, feet, R):
+        """feet: [(pos, rot)] of the two foot sites in the trunk frame; R: the
+        IMU's trunk-in-world rotation (3x3)."""
+        if self.needs_init:
+            self.anchor_xy = (R @ feet[self.anchor_foot][0])[:2].copy()
+            self.needs_init = False
+        self._reproject(R, feet)
+        cand = self._lowest_corner(R, feet)
+        if cand is None:
+            self.pending = None
+            self.pending_ticks = 0
+        else:
+            foot, local, world_xy = cand
+            if self.pending is not None and self.pending[0] == foot:
+                self.pending_ticks += 1
+            else:
+                self.pending = cand
+                self.pending_ticks = 1
+            if self.pending_ticks >= self.SWITCH_CONFIRM_TICKS:
+                foot, local, world_xy = self.pending
+                self.pending = None
+                self.anchor_foot = foot
+                self.anchor_local = local
+                self.anchor_xy = world_xy
+                self._reproject(R, feet)
+                self.pending_ticks = 0
+
+    def _reproject(self, R, feet):
+        pos, rot = feet[self.anchor_foot]
+        contact = R @ (rot @ self.anchor_local + pos)
+        self.position = np.array([self.anchor_xy[0] - contact[0], self.anchor_xy[1] - contact[1], -contact[2]])
+
+    def _lowest_corner(self, R, feet):
+        lowest = -self.SWITCH_MARGIN
+        best = None
+        for foot, (pos, rot) in enumerate(feet):
+            world = self.position + (self.corners[foot] @ rot.T + pos) @ R.T
+            i = int(np.argmin(world[:, 2]))
+            if world[i, 2] < lowest:
+                lowest = world[i, 2]
+                best = (foot, self.corners[foot][i].copy(), world[i, :2].copy())
+        return best
+
+    def anchor_world(self, feet, R):
+        pos, rot = feet[self.anchor_foot]
+        return self.position + R @ (rot @ self.anchor_local + pos)
+
+
+class OdomCompare:
+    """Run one PyOdometry per anchor set at the control rate and score each
+    against the simulator's trunk pose. The IMU is perfect (true trunk
+    rotation), so the sets differ only by their contact geometry."""
+
+    def __init__(self, model, sets):
+        self.frames = FootFrames(model)
+        self.odoms = [PyOdometry(n, c) for n, c in sets.items()]
+        self.start = None
+        self.path_len = 0.0
+        self.last_gt = None
+        self.ticks = 0
+        self.max_err = {o.name: 0.0 for o in self.odoms}
+        print("\nOdometry comparison: " + ", ".join(f"{o.name} ({len(o.corners[0])} pts/foot)" for o in self.odoms))
+
+    def step(self, data):
+        p_t, R_t = self.frames.trunk_world(data)
+        feet = self.frames.feet_in_trunk(data)
+        if self.start is None:
+            self.start = p_t.copy()
+            self.last_gt = p_t.copy()
+        self.path_len += float(np.linalg.norm((p_t - self.last_gt)[:2]))
+        self.last_gt = p_t.copy()
+        self.ticks += 1
+        for o in self.odoms:
+            o.update(feet, R_t)
+            self.max_err[o.name] = max(self.max_err[o.name], self._err_xy(o, p_t))
+
+    def _err_xy(self, o, p_t):
+        return float(np.linalg.norm(o.position[:2] - (p_t - self.start)[:2]))
+
+    def _line(self, data, final=False):
+        p_t, _ = self.frames.trunk_world(data)
+        parts = []
+        for o in self.odoms:
+            exy = self._err_xy(o, p_t) * 1000
+            ez = (o.position[2] - p_t[2]) * 1000
+            foot = "L" if o.anchor_foot == 0 else "R"
+            parts.append(f"{o.name}: xy {exy:5.1f} mm  z {ez:+5.1f} mm  [{foot}]")
+        head = f"[odom {self.ticks / 50:.0f}s  path {self.path_len:.2f} m]"
+        return head + "  " + "  |  ".join(parts)
+
+    def print_status(self, data):
+        print(self._line(data))
+
+    def print_summary(self, data):
+        p_t, _ = self.frames.trunk_world(data)
+        print("\nOdometry comparison summary (perfect IMU; errors vs MuJoCo trunk pose)")
+        print(f"  {self.ticks / 50:.1f} s, ground-truth XY path {self.path_len:.3f} m")
+        print(f"  {'set':>8}  {'pts':>3}  {'final xy err':>12}  {'max xy err':>10}  {'xy err / path':>13}  {'final z err':>11}")
+        for o in self.odoms:
+            exy = self._err_xy(o, p_t)
+            ez = o.position[2] - p_t[2]
+            rel = f"{100 * exy / self.path_len:.1f} %" if self.path_len > 0.05 else "   n/a"
+            print(f"  {o.name:>8}  {len(o.corners[0]):>3}  {exy * 1000:9.1f} mm  {self.max_err[o.name] * 1000:7.1f} mm  {rel:>13}  {ez * 1000:+8.1f} mm")
+
+    def anchors_world(self, data):
+        """[(name, world point)] — where each replica believes it stands, drawn
+        on the real foot so a wrong anchor shows as a floating sphere."""
+        feet = self.frames.feet_world(data)
+        out = []
+        for o in self.odoms:
+            pos, rot = feet[o.anchor_foot]
+            out.append((o.name, rot @ o.anchor_local + pos))
+        return out
+
+
+class OdomAnchorOverlay:
+    """Draw anchor sets into viewer.user_scn every frame: each set's points on
+    both feet in the set's colour (4-point sets also as a rectangle), the
+    lowest point of each set in red, the foot-site origin in white, and, with
+    --odom-compare, each replica's current anchor as a big sphere."""
+
+    ANCHOR_RGBA = (1.0, 0.1, 0.1, 1.0)
+    SITE_RGBA = (1.0, 1.0, 1.0, 1.0)
+
+    def __init__(self, model, sets):
+        self.frames = FootFrames(model)
+        self.sets = sets
+        print("\nOdometry anchor points drawn: " + ", ".join(
+            f"{n} ({len(c[0])} pts/foot, {self._colour_name(n)})" for n, c in sets.items())
+            + "; red = lowest point of a set, white = foot site")
+
+    @staticmethod
+    def _colour_name(name):
+        return {"v15": "blue", "alpha4": "green", "alpha16": "magenta"}.get(name, "yellow")
+
+    def draw(self, data, scn, compare=None):
+        scn.ngeom = 0
+        feet = self.frames.feet_world(data)
+        for pos, _rot in feet:
+            self._sphere(scn, pos, 0.002, self.SITE_RGBA)
+        for name, corners in self.sets.items():
+            rgba = ODOM_SET_RGBA.get(name, _ODOM_FALLBACK_RGBA)
+            world = [corners[f] @ rot.T + pos for f, (pos, rot) in enumerate(feet)]
+            lowest = min(((f, i) for f in range(2) for i in range(len(world[f]))), key=lambda fi: world[fi[0]][fi[1], 2])
+            for f in range(2):
+                if len(world[f]) == 4:
+                    self._polygon(scn, world[f], 0.0006, rgba)
+                for i, p in enumerate(world[f]):
+                    if (f, i) == lowest:
+                        self._sphere(scn, p, 0.0035, self.ANCHOR_RGBA)
+                    else:
+                        self._sphere(scn, p, 0.002, rgba)
+        if compare is not None:
+            for name, p in compare.anchors_world(data):
+                self._sphere(scn, p, 0.006, ODOM_SET_RGBA.get(name, _ODOM_FALLBACK_RGBA))
+
+    @staticmethod
+    def _sphere(scn, pos, radius, rgba):
+        if scn.ngeom >= scn.maxgeom:
+            return
+        g = scn.geoms[scn.ngeom]
+        mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_SPHERE, np.array([radius, 0, 0]),
+                            np.asarray(pos, dtype=np.float64), np.eye(3).flatten(),
+                            np.array(rgba, dtype=np.float32))
+        scn.ngeom += 1
+
+    @staticmethod
+    def _polygon(scn, pts, width, rgba):
+        n = len(pts)
+        for i in range(n):
+            if scn.ngeom >= scn.maxgeom:
+                return
+            g = scn.geoms[scn.ngeom]
+            mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3), np.zeros(3),
+                                np.eye(3).flatten(), np.array(rgba, dtype=np.float32))
+            mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_CAPSULE, width,
+                                 np.asarray(pts[i], dtype=np.float64),
+                                 np.asarray(pts[(i + 1) % n], dtype=np.float64))
+            scn.ngeom += 1
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run ONNX policy in MuJoCo")
     parser.add_argument("--roller", action="store_true", help="Use roller skate robot XML (robot_walk_rollers.xml)")
+    parser.add_argument("--scene", type=str, default=None, help="Path to a scene XML, overriding the default pick (e.g. src/mjlab_microduck/robot/microduck/scene_allcollisions.xml)")
     parser.add_argument("--walking", type=str, default=None, help="Path to walking policy ONNX file")
     parser.add_argument("--standing", "-s", type=str, default=None, help="Path to standing policy ONNX file")
     parser.add_argument("--ground-pick", type=str, default=None, help="Path to ground pick policy ONNX file (press G to activate)")
@@ -830,10 +1197,22 @@ def main():
                         help="Use the unified 13D command obs layout (twist+head_pose+body_pose). "
                              "Required for policies trained with the new pose-command-tracking setup. "
                              "Old policies (51D obs, head_offset added to ctrl) need this flag OFF.")
-    parser.add_argument("--current-limit", type=float, default=1.75,
-                        help="XL330 firmware current limit [A]. Actuator torque is clipped to "
-                             "+/- current_limit * kt (kt from the bam package), matching the "
-                             "current saturation modeled in training. <=0 disables.")
+    parser.add_argument("--no-bam", action="store_true",
+                        help="Use the XML MuJoCo position actuators instead of the BAM M6 "
+                             "voltage/friction model the policies are trained against.")
+    parser.add_argument("--vin", type=float, default=7.4,
+                        help="BAM battery voltage [V]. Training samples per-env in "
+                             f"{BAM_VIN_RANGE}; 7.4 = nominal 2S LiPo.")
+    parser.add_argument("--vin-drop-gain", type=float, default=0.1,
+                        help="BAM load-dependent voltage sag gain [V/Nm], V = vin - gain*sum|tau|. "
+                             f"Training samples per-env in {BAM_VIN_DROP_GAIN_RANGE}. 0 disables.")
+    parser.add_argument("--kp-fw", type=float, default=BAM_KP_FW,
+                        help="BAM firmware P-gain (training uses %(default)s).")
+    parser.add_argument("--current-limit", type=float, default=0.0,
+                        help="XL330 firmware current limit [A]. With BAM this is the duty-cycle "
+                             "limiter of the voltage model (as bam models it); with --no-bam the "
+                             "actuator force is clipped to +/- current_limit * kt. Training runs "
+                             "WITHOUT a current limit, so the default is off (<=0).")
     parser.add_argument("--foot-friction", type=float, default=None,
                         help="Override the foot sliding friction (mu) to emulate the real grippy "
                              "PU sole. Training used mu~1.0 (range 0.7-1.3); real PU is likely "
@@ -842,6 +1221,15 @@ def main():
                         help="Soften foot contact: solref time constant (s) for the foot geoms "
                              "(default sim ~0.02 = stiff/rigid). Larger = softer, to emulate the "
                              "compliant PU sole. e.g. --foot-solref 0.04")
+    parser.add_argument("--odom-anchor-points", nargs="?", const="all", default=None, metavar="SETS",
+                        help="Draw the odometry's candidate contact points on both feet, from "
+                             "scripts/odom_anchor_sets.json: 'all' (default when given bare) or a "
+                             "comma-separated subset of v15,alpha4,alpha16. Red = lowest point of a set.")
+    parser.add_argument("--odom-compare", action="store_true",
+                        help="Run a replica of the robot's contact odometry per anchor set on the "
+                             "simulated legs (perfect IMU) and print each set's error against the "
+                             "true trunk pose every second and at exit. Drives the robot around to "
+                             "compare drift; combine with --odom-anchor-points to see each anchor.")
     args = parser.parse_args()
 
     if not args.walking and not args.standing and not args.sitstand:
@@ -871,23 +1259,38 @@ def main():
             return
 
     # Load MuJoCo model. Kick policies get a scene with a ball to kick.
-    if args.roller:
+    # --scene overrides everything (any scene whose robot has the standard
+    # 14-servo layout works, e.g. scene_allcollisions.xml).
+    if args.scene:
+        xml_path = args.scene
+    elif args.roller:
         xml_path = MICRODUCK_ROLLERS_XML
     elif args.kick_left or args.kick_right:
         xml_path = MICRODUCK_BALL_XML
     else:
         xml_path = MICRODUCK_XML
     print(f"Loading MuJoCo model from: {xml_path}")
-    model = mujoco.MjModel.from_xml_path(xml_path)
-    model.opt.timestep = 0.005
-    data = mujoco.MjData(model)
+    bam_ctrl = None
+    if not args.no_bam:
+        # Same actuator the policies are trained against in warp (BAM M6 XL330,
+        # voltage control + load-dependent friction budget), driven on CPU by
+        # bam.mujoco.MujocoController. Voltage DR collapses to fixed --vin /
+        # --vin-drop-gain (training samples them per env).
+        bam_model = load_bam_model(args.kp_fw, args.vin, args.current_limit)
+        vin_drop_gain = args.vin_drop_gain if args.vin_drop_gain > 0 else None
+        model, data, bam_ctrl, _bam_names = load_mujoco_with_bam(
+            xml_path, bam_model, 0.005, vin_drop_gain, BAM_VIN_MIN)
+    else:
+        model = mujoco.MjModel.from_xml_path(xml_path)
+        model.opt.timestep = 0.005
+        data = mujoco.MjData(model)
+        print("Legacy MuJoCo position actuators (--no-bam): NOT the actuator the policy was trained with")
 
-    # XL330 firmware current limit. The motors saturate current at ~1.75 A; since
-    # torque = kt * current, this caps the actuator force at +/- kt * I_max. The
-    # MuJoCo position actuators here are not the BAM voltage model, but clipping
-    # their output force reproduces the same current saturation the policy was
-    # trained against (see BamActuator.max_current). kt comes from the bam package.
-    if args.current_limit and args.current_limit > 0:
+    # (--no-bam only) XL330 firmware current limit. The motors saturate current
+    # at ~1.75 A; since torque = kt * current, this caps the actuator force at
+    # +/- kt * I_max. With BAM the limiter is modelled inside the voltage
+    # controller instead (see load_bam_model). kt comes from the bam package.
+    if args.no_bam and args.current_limit and args.current_limit > 0:
         from bam.model import load_model
         kt = load_model(motor_name="xl330", model="m6").kt.value
         torque_limit = kt * args.current_limit
@@ -920,6 +1323,7 @@ def main():
     # Initialize policy
     policy = PolicyInference(
         model, data,
+        bam_ctrl=bam_ctrl,
         walking_onnx_path=args.walking,
         action_scale=args.action_scale,
         delay_min_lag=delay_min_lag,
@@ -977,7 +1381,9 @@ def main():
     data.qpos[qpos_adr + 3:qpos_adr + 7] = [1, 0, 0, 0]
     for i, qpos_idx in enumerate(policy.joint_qpos_indices):
         data.qpos[qpos_idx] = policy.default_pose[i]
-    data.ctrl[:] = policy.default_pose
+    if bam_ctrl is not None:
+        bam_ctrl.reset(data.qpos)   # clears voltage-drop state, q_target = current qpos
+    policy.set_position_targets(policy.default_pose)
     mujoco.mj_forward(model, data)
 
     # Verify observation size
@@ -1040,6 +1446,22 @@ def main():
     original_kp = None
     if args.record:
         original_kp = model.actuator_gainprm[:, 0].copy()
+
+    # Standby (--record) gains: the legacy path sets the position-actuator kp
+    # to 2.0 (XML kp 0.55 ~ kp_fw 200). Under BAM apply the same ratio to the
+    # firmware gain so both paths hold with the same relative stiffness.
+    _XML_KP_NOMINAL = 0.55
+    _STANDBY_KP = 2.0
+
+    def set_standby_gains(on: bool):
+        if bam_ctrl is not None:
+            bam_ctrl.model.actuator.kp = args.kp_fw * (_STANDBY_KP / _XML_KP_NOMINAL if on else 1.0)
+            print(f"  BAM kp_fw set to {bam_ctrl.model.actuator.kp:.0f}")
+            return
+        for i in range(model.nu):
+            kp = _STANDBY_KP if on else original_kp[i]
+            model.actuator_gainprm[i, 0] = kp
+            model.actuator_biasprm[i, 1] = -kp
 
     # Cache the trunk freejoint qvel address so the push handler can write to
     # the trunk's world-frame linear velocity directly (qvel[0..3]).
@@ -1220,16 +1642,19 @@ def main():
 
     with TerminalInput() as term, \
          mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False) as viewer:
+        odom_overlay = OdomAnchorOverlay(model, load_odom_anchor_sets(args.odom_anchor_points)) \
+            if args.odom_anchor_points else None
+        odom_compare = OdomCompare(model, load_odom_anchor_sets()) if args.odom_compare else None
+        if odom_overlay is not None:
+            odom_overlay.draw(data, viewer.user_scn, odom_compare)
         viewer.sync()
         start_time = time.time()
 
         if args.record:
             policy_enable_time = start_time + 1.0
             print("Recording mode: policy will be enabled after 1 second standby")
-            for i in range(model.nu):
-                model.actuator_gainprm[i, 0] = 2.0
-                model.actuator_biasprm[i, 1] = -2.0
-            print("  Standby mode: kp set to 2.0")
+            set_standby_gains(True)
+            print("  Standby mode: kp set to 2.0 (XML units)")
 
         try:
             prev_step_time = time.time()
@@ -1244,10 +1669,7 @@ def main():
                     if step_start >= policy_enable_time:
                         policy_enabled = True
                         if original_kp is not None:
-                            for i in range(model.nu):
-                                kp = original_kp[i]
-                                model.actuator_gainprm[i, 0] = kp
-                                model.actuator_biasprm[i, 1] = -kp
+                            set_standby_gains(False)
                             print("Policy inference enabled (after 1s standby)")
                             print(f"  Restored original kp gains (range: [{original_kp.min():.2f}, {original_kp.max():.2f}])")
 
@@ -1341,12 +1763,25 @@ def main():
                         print(f"  Action min/max: [{action.min():.4f}, {action.max():.4f}]")
                         if policy.use_delay:
                             print(f"  Delay: {policy.current_lag} timesteps (buffered)")
-                        print(f"  Applied ctrl (first 5): {data.ctrl[:5]}")
-                        print(f"  Applied ctrl (last 5):  {data.ctrl[-5:]}")
+                        ctrl_kind = "torque [Nm]" if bam_ctrl is not None else "position target"
+                        print(f"  Applied ctrl ({ctrl_kind}, first 5): {data.ctrl[:5]}")
+                        print(f"  Applied ctrl ({ctrl_kind}, last 5):  {data.ctrl[-5:]}")
 
                 for _ in range(decimation):
+                    if bam_ctrl is not None:
+                        # BAM owns control/torque/friction: update() runs the
+                        # firmware P-loop + DC-motor equation, writes the torque
+                        # to data.ctrl and pushes the friction budget onto the
+                        # dofs so MuJoCo's solver applies it on this step.
+                        bam_ctrl.update()
                     mujoco.mj_step(model, data)
 
+                if odom_compare is not None:
+                    odom_compare.step(data)
+                    if control_step_count % 50 == 0:
+                        odom_compare.print_status(data)
+                if odom_overlay is not None:
+                    odom_overlay.draw(data, viewer.user_scn, odom_compare)
                 viewer.sync()
 
                 elapsed = time.time() - step_start
@@ -1358,6 +1793,8 @@ def main():
             print("\n\nKeyboardInterrupt received (Ctrl+C). Saving data...")
 
     print("\nInference stopped.")
+    if odom_compare is not None:
+        odom_compare.print_summary(data)
 
     if csv_data is not None and len(csv_data) > 0:
         print(f"\nSaving {len(csv_data)} steps to: {args.save_csv}")
