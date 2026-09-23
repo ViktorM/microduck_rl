@@ -6072,6 +6072,34 @@ def ball_vel_in_base(
 
 
 # --------------------------------------------------------------------------- #
+# BallWalk task — circus-style walking balanced on top of a 60cm ball          #
+# --------------------------------------------------------------------------- #
+
+
+def ball_balance_gaussian(
+    env: ManagerBasedRlEnv,
+    std: float = 0.05,
+    asset_name: str = "ball",
+) -> torch.Tensor:
+    """Gaussian on the horizontal robot-root ↔ ball-center offset.
+
+    The core balance signal of the BallWalk task: riding a ball means keeping
+    the base vertically above the ball center — any lateral offset is the
+    beginning of a fall, and rolling the ball to a commanded velocity means
+    the CONTACT point chases the base, re-centering this term. Gated on a
+    good state (only payable while actually on top), so not farmable from the
+    floor: falling off drops the root below the height termination long
+    before a floor pose could collect it. std ≈ the offset that is still
+    recoverable (0.05 m ≈ 10° of arc on a 0.3 m-radius ball).
+    """
+    robot: Entity = env.scene["robot"]
+    ball: Entity = env.scene[asset_name]
+    d_xy = robot.data.root_link_pos_w[:, :2] - ball.data.root_link_pos_w[:, :2]
+    dist_sq = (d_xy**2).sum(dim=1)
+    return torch.exp(-dist_sq / (std**2)).nan_to_num(0.0)
+
+
+# --------------------------------------------------------------------------- #
 # Tâche SPIN — rotation rapide sur place sur rollers                            #
 # --------------------------------------------------------------------------- #
 # Enveloppe de phase : la commande du slot bouton porte une phase, qui pilote

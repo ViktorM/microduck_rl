@@ -43,6 +43,10 @@ from .microduck_ball_kick_env_cfg import (
     make_microduck_ball_kick_env_cfg,
     MicroduckBallKickRlCfg,
 )
+from .microduck_ball_walk_env_cfg import (
+    make_microduck_ball_walk_env_cfg,
+    MicroduckBallWalkRlCfg,
+)
 from .microduck_sitstand_env_cfg import (
     make_microduck_sitstand_env_cfg,
     MicroduckSitStandRlCfg,
@@ -161,6 +165,16 @@ register_mjlab_task(
     env_cfg=make_microduck_ball_kick_env_cfg(),
     play_env_cfg=make_microduck_ball_kick_env_cfg(play=True),
     rl_cfg=MicroduckBallKickRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# BallWalk task — circus-style: balance and walk on top of a free-rolling
+# 60cm ball, driving it with twist commands (flat terrain only).
+register_mjlab_task(
+    task_id="Mjlab-BallWalk-Flat-MicroDuck",
+    env_cfg=make_microduck_ball_walk_env_cfg(),
+    play_env_cfg=make_microduck_ball_walk_env_cfg(play=True),
+    rl_cfg=MicroduckBallWalkRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
